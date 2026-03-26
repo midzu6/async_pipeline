@@ -43,6 +43,61 @@ func SelectUsers(in, out chan interface{}) {
 func SelectMessages(in, out chan interface{}) {
 	// 	in - User
 	// 	out - MsgID
+	sem := make(chan struct{}, 30)
+	wg := &sync.WaitGroup{}
+	batch := make([]User, 0, 2)
+
+	for user := range in {
+		u, ok := user.(User)
+		if !ok {
+			continue
+		}
+		batch = append(batch, u)
+		if len(batch) == 2 {
+			wg.Add(1)
+			tmp := make([]User, len(batch))
+			copy(tmp, batch)
+			sem <- struct{}{}
+			go func() {
+				defer func() {
+					wg.Done()
+					<-sem
+				}()
+				messages, err := GetMessages(tmp[0], tmp[1])
+				if err != nil {
+					return
+				}
+				for _, msg := range messages {
+					out <- msg
+				}
+			}()
+			batch = batch[:0]
+		}
+	}
+	if len(batch) > 0 {
+		tmp := make([]User, len(batch))
+		copy(tmp, batch)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			go func() {
+				wg.Done()
+				<-sem
+			}()
+			messages, err := GetMessages(tmp[0])
+			if err != nil {
+				return
+			}
+			for _, msg := range messages {
+				out <- msg
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
 }
 
 func CheckSpam(in, out chan interface{}) {

@@ -1,9 +1,33 @@
 package async_pipeline
 
-import "sync"
+import (
+	"fmt"
+	"sort"
+	"sync"
+)
 
 func RunPipeline(cmds ...cmd) {
+	if len(cmds) == 0 {
+		return
+	}
 
+	var in chan interface{}
+	wg := &sync.WaitGroup{}
+
+	for _, command := range cmds {
+		out := make(chan interface{})
+
+		wg.Add(1)
+		go func(cmd cmd, in, out chan interface{}) {
+			defer wg.Done()
+			cmd(in, out)
+			close(out)
+		}(command, in, out)
+
+		in = out
+	}
+
+	wg.Wait()
 }
 
 func SelectUsers(in, out chan interface{}) {
@@ -16,7 +40,7 @@ func SelectUsers(in, out chan interface{}) {
 
 	for email := range in {
 		wg.Add(1)
-		go func() {
+		go func(email interface{}) {
 			defer func() {
 				wg.Done()
 			}()
@@ -29,15 +53,15 @@ func SelectUsers(in, out chan interface{}) {
 			mu.Lock()
 			if _, ok = uniqueIds[user.ID]; !ok {
 				uniqueIds[user.ID] = struct{}{}
+				mu.Unlock()
 				out <- user
+			} else {
 				mu.Unlock()
 			}
-		}()
+		}(email)
 	}
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
+
+	wg.Wait()
 }
 
 func SelectMessages(in, out chan interface{}) {
@@ -58,7 +82,7 @@ func SelectMessages(in, out chan interface{}) {
 			tmp := make([]User, len(batch))
 			copy(tmp, batch)
 			sem <- struct{}{}
-			go func() {
+			go func(tmp []User) {
 				defer func() {
 					wg.Done()
 					<-sem
@@ -70,7 +94,7 @@ func SelectMessages(in, out chan interface{}) {
 				for _, msg := range messages {
 					out <- msg
 				}
-			}()
+			}(tmp)
 			batch = batch[:0]
 		}
 	}
@@ -79,8 +103,8 @@ func SelectMessages(in, out chan interface{}) {
 		copy(tmp, batch)
 		wg.Add(1)
 		sem <- struct{}{}
-		go func() {
-			go func() {
+		go func(tmp []User) {
+			defer func() {
 				wg.Done()
 				<-sem
 			}()
@@ -91,21 +115,72 @@ func SelectMessages(in, out chan interface{}) {
 			for _, msg := range messages {
 				out <- msg
 			}
-		}()
+		}(tmp)
 	}
 
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
+	wg.Wait()
 }
 
 func CheckSpam(in, out chan interface{}) {
 	// in - MsgID
 	// out - MsgData
+
+	wg := &sync.WaitGroup{}
+	sem := make(chan struct{}, 5)
+
+	for mId := range in {
+		id, ok := mId.(MsgID)
+		if !ok {
+			continue
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(id MsgID) {
+			defer func() {
+				wg.Done()
+				<-sem
+			}()
+			isSpam, err := HasSpam(id)
+			if err != nil {
+				return
+			}
+			resp := MsgData{
+				ID:      id,
+				HasSpam: isSpam,
+			}
+			out <- resp
+		}(id)
+	}
+
+	wg.Wait()
+
 }
 
 func CombineResults(in, out chan interface{}) {
 	// in - MsgData
 	// out - string
+
+	arr := make([]MsgData, 0)
+
+	for data := range in {
+		dt, ok := data.(MsgData)
+		if !ok {
+			continue
+		}
+		arr = append(arr, dt)
+	}
+
+	sort.Slice(arr, func(i, j int) bool {
+		if arr[i].HasSpam && !arr[j].HasSpam {
+			return true
+		}
+		if !arr[i].HasSpam && arr[j].HasSpam {
+			return false
+		}
+		return arr[i].ID < arr[j].ID
+	})
+
+	for _, val := range arr {
+		out <- fmt.Sprintf("%v %v", val.HasSpam, val.ID)
+	}
 }
